@@ -1,0 +1,26 @@
+# Downloaded llama.cpp binaries and CUDA runtime DLLs
+/llamacpp/
+
+# Download cache and extracted staging files
+/tmp/
+
+# Runtime logs and install history
+/logs/
+/versions/
+/install.log
+*.log
+
+# Local user config, launchers, and model files
+/conf/user.config.json
+/Start-LlamaServer.generated.cmd
+/models/
+*.gguf
+*.safetensors
+*.bin
+
+# Local editor and OS files
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
