@@ -14,6 +14,7 @@ This project is intentionally lightweight. It does not bundle `llama.cpp`, CUDA 
 - Writes installed version metadata to `llamacpp/install.info`, `versions/*.info`, and `install.log`.
 - Blocks updates while `llama-server.exe` is running from the target folder.
 - Provides a WinForms GUI for selecting a model, toggling parameters, checking updates, installing updates, and running the server with a live console.
+- Adds hardware/model analysis, parameter help, and a Balanced auto-tune preset.
 - Uses only Windows PowerShell and built-in .NET WinForms.
 
 ## Requirements
@@ -38,7 +39,8 @@ Important fields:
   "LogPath": "install.log",
   "CudaMajor": "13",
   "CudaDlls": "13.3",
-  "ModelPath": ""
+  "ModelPath": "",
+  "MmprojPath": ""
 }
 ```
 
@@ -57,6 +59,12 @@ For CUDA 13.3, the updater looks for assets like:
 If the exact `CudaDlls` version is not found, the script tries to select the newest matching asset for the configured `CudaMajor`.
 
 Set `ModelPath` in the GUI, `conf/user.config.json`, or `conf/config.json`. It can be absolute or relative to the cloned repository folder. Do not commit private model paths or model files.
+
+`MmprojPath` is optional. Set it only when the model needs a multimodal projector. When filled, the launcher passes it to `llama-server.exe` as:
+
+```cmd
+--mmproj <path-to-mmproj>
+```
 
 ## Usage
 
@@ -85,6 +93,25 @@ Start-LlamaServer.cmd
 ```
 
 The GUI can also generate a direct `Start-LlamaServer.generated.cmd` launcher. That generated file is ignored by Git because it may contain local model paths.
+
+## Hardware, Model Analysis, And Auto Tune
+
+The GUI includes these utility buttons:
+
+- `Hardware`: detects CPU threads, system RAM, and NVIDIA GPU VRAM through `nvidia-smi` when available.
+- `Model Info`: reads model size, filename quantization, and basic GGUF metadata such as architecture, block count, and native context when available.
+- `Auto Tune`: applies a Balanced recommendation for `--threads`, `--n-gpu-layers`, `--ctx-size`, batch sizes, KV cache types, flash attention, mmap, parallel slots, and MoE-related CPU settings.
+- `Param Help`: prints concise explanations for important `llama-server.exe` options.
+
+The speed estimate shown by Auto Tune is intentionally rough. It is based on GPU name and model size, not a real benchmark. Use it as a starting point, then adjust after observing actual token/s and VRAM usage.
+
+Optimization hints:
+
+- Increase `--n-gpu-layers` when VRAM remains free after loading.
+- Decrease `--n-gpu-layers`, `--batch-size`, or `--ubatch-size` if model loading fails or Windows becomes unstable.
+- Increase `--ctx-size` only when you need longer context; it increases KV cache memory.
+- Keep `--flash-attn on` for modern NVIDIA GPUs unless it causes errors.
+- Use `MmprojPath` only for vision/multimodal models, and make sure it matches the model family.
 
 ## Update Behavior
 

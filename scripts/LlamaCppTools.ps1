@@ -20,6 +20,7 @@ function New-LocalLlamaDefaultConfig {
         CudaMajor     = '13'
         CudaDlls      = '13.3'
         ModelPath     = ''
+        MmprojPath    = ''
         Params        = @(
             [ordered]@{ Name = '--host';           Enabled = $true;  Value = '127.0.0.1'; Type = 'value'  },
             [ordered]@{ Name = '--port';           Enabled = $true;  Value = '8080';      Type = 'value'  },
@@ -137,6 +138,596 @@ function Assert-PathInside {
     if (($full -ine $parentFull) -and (-not $full.StartsWith($parentPrefix, [System.StringComparison]::OrdinalIgnoreCase))) {
         throw "Refusing to modify path outside allowed parent. Path=$full Parent=$parentFull"
     }
+}
+
+function ConvertTo-SizeGb {
+    param([double]$Bytes)
+
+    if ($Bytes -le 0) {
+        return 0
+    }
+
+    [math]::Round(($Bytes / 1GB), 2)
+}
+
+function Get-NvidiaSmiPath {
+    $cmd = Get-Command 'nvidia-smi.exe' -ErrorAction SilentlyContinue
+    if ($cmd) {
+        return $cmd.Source
+    }
+
+    $defaultPath = Join-Path $env:ProgramFiles 'NVIDIA Corporation\NVSMI\nvidia-smi.exe'
+    if (Test-Path -LiteralPath $defaultPath) {
+        return $defaultPath
+    }
+
+    return $null
+}
+
+function Get-LlamaHardwareInfo {
+    $logicalThreads = [Environment]::ProcessorCount
+    $cpuName = 'unknown'
+    $totalRamBytes = 0
+    $freeRamBytes = 0
+
+    try {
+        $cpu = Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1
+        if ($cpu.Name) {
+            $cpuName = [string]$cpu.Name
+        }
+    } catch {
+    }
+
+    if ($cpuName -eq 'unknown') {
+        try {
+            $cpuReg = Get-ItemProperty -LiteralPath 'HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0' -ErrorAction Stop
+            if ($cpuReg.ProcessorNameString) {
+                $cpuName = [string]$cpuReg.ProcessorNameString
+            }
+        } catch {
+        }
+    }
+
+    try {
+        Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction SilentlyContinue
+        $computerInfo = New-Object Microsoft.VisualBasic.Devices.ComputerInfo
+        $totalRamBytes = [double]$computerInfo.TotalPhysicalMemory
+        $freeRamBytes = [double]$computerInfo.AvailablePhysicalMemory
+    } catch {
+        try {
+            $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+            $totalRamBytes = [double]$os.TotalVisibleMemorySize * 1KB
+            $freeRamBytes = [double]$os.FreePhysicalMemory * 1KB
+        } catch {
+        }
+    }
+
+    $gpus = @()
+    $nvidiaSmi = Get-NvidiaSmiPath
+    if ($nvidiaSmi) {
+        try {
+            $lines = & $nvidiaSmi --query-gpu=name,memory.total,memory.free,driver_version --format=csv,noheader,nounits 2>$null
+            foreach ($line in @($lines)) {
+                $parts = @($line -split ',\s*')
+                if ($parts.Count -ge 4) {
+                    $gpus += [pscustomobject]@{
+                        Name          = [string]$parts[0]
+                        TotalVramMb   = [int]$parts[1]
+                        FreeVramMb    = [int]$parts[2]
+                        DriverVersion = [string]$parts[3]
+                    }
+                }
+            }
+        } catch {
+        }
+    }
+
+    [pscustomobject]@{
+        CpuName        = $cpuName
+        LogicalThreads = $logicalThreads
+        TotalRamGb     = ConvertTo-SizeGb -Bytes $totalRamBytes
+        FreeRamGb      = ConvertTo-SizeGb -Bytes $freeRamBytes
+        NvidiaSmiPath  = $nvidiaSmi
+        Gpus           = $gpus
+    }
+}
+
+function Read-GgufString {
+    param([Parameter(Mandatory = $true)][System.IO.BinaryReader]$Reader)
+
+    $length = [uint64]$Reader.ReadUInt64()
+    if ($length -eq 0) {
+        return ''
+    }
+
+    if ($length -gt 1048576) {
+        throw "GGUF string is too large to read: $length bytes"
+    }
+
+    $bytes = $Reader.ReadBytes([int]$length)
+    [System.Text.Encoding]::UTF8.GetString($bytes)
+}
+
+function Skip-GgufBytes {
+    param(
+        [Parameter(Mandatory = $true)][System.IO.BinaryReader]$Reader,
+        [Parameter(Mandatory = $true)][uint64]$Count
+    )
+
+    if ($Count -eq 0) {
+        return
+    }
+
+    if ($Reader.BaseStream.CanSeek) {
+        [void]$Reader.BaseStream.Seek([int64]$Count, [System.IO.SeekOrigin]::Current)
+    } else {
+        [void]$Reader.ReadBytes([int]$Count)
+    }
+}
+
+function Get-GgufScalarSize {
+    param([uint32]$Type)
+
+    switch ($Type) {
+        0 { return 1 }
+        1 { return 1 }
+        2 { return 2 }
+        3 { return 2 }
+        4 { return 4 }
+        5 { return 4 }
+        6 { return 4 }
+        7 { return 1 }
+        10 { return 8 }
+        11 { return 8 }
+        12 { return 8 }
+        default { return 0 }
+    }
+}
+
+function Read-GgufScalarValue {
+    param(
+        [Parameter(Mandatory = $true)][System.IO.BinaryReader]$Reader,
+        [Parameter(Mandatory = $true)][uint32]$Type
+    )
+
+    switch ($Type) {
+        0 { return $Reader.ReadByte() }
+        1 { return $Reader.ReadSByte() }
+        2 { return $Reader.ReadUInt16() }
+        3 { return $Reader.ReadInt16() }
+        4 { return $Reader.ReadUInt32() }
+        5 { return $Reader.ReadInt32() }
+        6 { return $Reader.ReadSingle() }
+        7 { return $Reader.ReadBoolean() }
+        8 { return Read-GgufString -Reader $Reader }
+        10 { return $Reader.ReadUInt64() }
+        11 { return $Reader.ReadInt64() }
+        12 { return $Reader.ReadDouble() }
+        default { return $null }
+    }
+}
+
+function Skip-GgufValue {
+    param(
+        [Parameter(Mandatory = $true)][System.IO.BinaryReader]$Reader,
+        [Parameter(Mandatory = $true)][uint32]$Type
+    )
+
+    if ($Type -eq 8) {
+        $length = [uint64]$Reader.ReadUInt64()
+        Skip-GgufBytes -Reader $Reader -Count $length
+        return
+    }
+
+    if ($Type -eq 9) {
+        $arrayType = [uint32]$Reader.ReadUInt32()
+        $arrayLength = [uint64]$Reader.ReadUInt64()
+        if ($arrayType -eq 8) {
+            for ($i = [uint64]0; $i -lt $arrayLength; $i += 1) {
+                $length = [uint64]$Reader.ReadUInt64()
+                Skip-GgufBytes -Reader $Reader -Count $length
+            }
+            return
+        }
+
+        $scalarSize = Get-GgufScalarSize -Type $arrayType
+        if ($scalarSize -gt 0) {
+            Skip-GgufBytes -Reader $Reader -Count ([uint64]($scalarSize * $arrayLength))
+            return
+        }
+
+        throw "Unsupported GGUF array type: $arrayType"
+    }
+
+    $size = Get-GgufScalarSize -Type $Type
+    if ($size -gt 0) {
+        Skip-GgufBytes -Reader $Reader -Count ([uint64]$size)
+        return
+    }
+
+    throw "Unsupported GGUF value type: $Type"
+}
+
+function Get-GgufFileTypeName {
+    param([AllowNull()]$FileType)
+
+    if ($null -eq $FileType) {
+        return ''
+    }
+
+    $map = @{
+        0 = 'F32'; 1 = 'F16'; 2 = 'Q4_0'; 3 = 'Q4_1'; 6 = 'Q5_0'; 7 = 'Q5_1'; 8 = 'Q8_0'
+        10 = 'Q2_K'; 11 = 'Q3_K_S'; 12 = 'Q3_K_M'; 13 = 'Q3_K_L'; 14 = 'Q4_K_S'; 15 = 'Q4_K_M'
+        16 = 'Q5_K_S'; 17 = 'Q5_K_M'; 18 = 'Q6_K'; 19 = 'IQ2_XXS'; 20 = 'IQ2_XS'; 21 = 'Q2_K_S'
+        22 = 'IQ3_XS'; 23 = 'IQ3_XXS'; 24 = 'IQ1_S'; 25 = 'IQ4_NL'; 26 = 'IQ3_S'; 27 = 'IQ3_M'
+        28 = 'IQ2_S'; 29 = 'IQ2_M'; 30 = 'IQ4_XS'; 31 = 'IQ1_M'; 32 = 'BF16'; 33 = 'Q4_0_4_4'
+        34 = 'Q4_0_4_8'; 35 = 'Q4_0_8_8'; 36 = 'TQ1_0'; 37 = 'TQ2_0'
+    }
+
+    $key = [int]$FileType
+    if ($map.ContainsKey($key)) {
+        return $map[$key]
+    }
+
+    return "file_type_$key"
+}
+
+function Read-GgufMetadata {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $metadata = @{}
+    $stream = $null
+    $reader = $null
+
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $reader = New-Object System.IO.BinaryReader($stream, [System.Text.Encoding]::UTF8)
+        $magic = $reader.ReadUInt32()
+        if ($magic -ne 0x46554747) {
+            return [pscustomobject]@{ IsGguf = $false; Metadata = @{}; Error = 'Not a GGUF file' }
+        }
+
+        $version = $reader.ReadUInt32()
+        $tensorCount = $reader.ReadUInt64()
+        $metadataCount = $reader.ReadUInt64()
+        $maxItems = [math]::Min([uint64]512, $metadataCount)
+
+        for ($i = [uint64]0; $i -lt $maxItems; $i += 1) {
+            if ($stream.Position -gt 16777216) {
+                break
+            }
+
+            $key = Read-GgufString -Reader $reader
+            $type = [uint32]$reader.ReadUInt32()
+
+            if (($key -like 'tokenizer.*') -and $metadata.ContainsKey('general.architecture')) {
+                break
+            }
+
+            if ($type -eq 9) {
+                Skip-GgufValue -Reader $reader -Type $type
+                continue
+            }
+
+            $value = Read-GgufScalarValue -Reader $reader -Type $type
+            $metadata[$key] = $value
+        }
+
+        [pscustomobject]@{
+            IsGguf        = $true
+            Version       = $version
+            TensorCount   = $tensorCount
+            MetadataCount = $metadataCount
+            Metadata      = $metadata
+            Error         = ''
+        }
+    } catch {
+        [pscustomobject]@{ IsGguf = $false; Metadata = $metadata; Error = $_.Exception.Message }
+    } finally {
+        if ($reader) {
+            $reader.Close()
+        } elseif ($stream) {
+            $stream.Close()
+        }
+    }
+}
+
+function Get-ModelQuantFromName {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    if ($Name -match '(?i)(IQ[0-9]_[A-Z0-9_]+|TQ[0-9]_[A-Z0-9_]+|Q[0-9]_[A-Z0-9_]+|F16|BF16|F32)') {
+        return $Matches[1].ToUpperInvariant()
+    }
+
+    return ''
+}
+
+function Get-LlamaModelInfo {
+    param(
+        [string]$ModelPath,
+        [string]$MmprojPath
+    )
+
+    $resolvedModel = ''
+    $exists = $false
+    $sizeGb = 0
+    $fileName = ''
+    $metadata = $null
+    $architecture = ''
+    $quant = ''
+    $blockCount = $null
+    $contextLength = $null
+    $isLikelyMoe = $false
+    $isLikelyVision = $false
+
+    if (-not [string]::IsNullOrWhiteSpace($ModelPath)) {
+        $resolvedModel = Resolve-LocalPath -Path $ModelPath
+        $exists = Test-Path -LiteralPath $resolvedModel
+        $fileName = Split-Path -Leaf $resolvedModel
+        $quant = Get-ModelQuantFromName -Name $fileName
+        $isLikelyMoe = ($fileName -match '(?i)(moe|mixtral|a\d+b|deepseek|experts)')
+        $isLikelyVision = ($fileName -match '(?i)(vision|vl|llava|minicpmv|gemma-?3|qwen2vl|qwen2\.5vl)')
+
+        if ($exists) {
+            $item = Get-Item -LiteralPath $resolvedModel
+            $sizeGb = ConvertTo-SizeGb -Bytes $item.Length
+            $metadata = Read-GgufMetadata -Path $resolvedModel
+            if ($metadata.IsGguf) {
+                $map = $metadata.Metadata
+                if ($map.ContainsKey('general.architecture')) {
+                    $architecture = [string]$map['general.architecture']
+                }
+                if ($map.ContainsKey('general.file_type')) {
+                    $metadataQuant = Get-GgufFileTypeName -FileType $map['general.file_type']
+                    if ($metadataQuant) {
+                        $quant = $metadataQuant
+                    }
+                }
+
+                if ($architecture -and $map.ContainsKey("$architecture.block_count")) {
+                    $blockCount = [int]$map["$architecture.block_count"]
+                }
+                if ($architecture -and $map.ContainsKey("$architecture.context_length")) {
+                    $contextLength = [int]$map["$architecture.context_length"]
+                }
+            }
+        }
+    }
+
+    $resolvedMmproj = ''
+    $mmprojExists = $false
+    if (-not [string]::IsNullOrWhiteSpace($MmprojPath)) {
+        $resolvedMmproj = Resolve-LocalPath -Path $MmprojPath
+        $mmprojExists = Test-Path -LiteralPath $resolvedMmproj
+        $isLikelyVision = $true
+    }
+
+    [pscustomobject]@{
+        ModelPath       = $resolvedModel
+        ModelExists     = $exists
+        FileName        = $fileName
+        SizeGb          = $sizeGb
+        Quantization    = $quant
+        Architecture    = $architecture
+        BlockCount      = $blockCount
+        ContextLength   = $contextLength
+        IsLikelyMoe     = $isLikelyMoe
+        IsLikelyVision  = $isLikelyVision
+        MmprojPath      = $resolvedMmproj
+        MmprojExists    = $mmprojExists
+        MetadataError   = if ($metadata) { $metadata.Error } else { '' }
+    }
+}
+
+function Get-LlamaParam {
+    param(
+        [Parameter(Mandatory = $true)]$Config,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    foreach ($param in @($Config.Params)) {
+        if ([string]$param.Name -eq $Name) {
+            return $param
+        }
+    }
+
+    return $null
+}
+
+function Get-PrimaryGpuInfo {
+    param($Hardware)
+
+    $gpus = @($Hardware.Gpus)
+    if ($gpus.Count -eq 0) {
+        return $null
+    }
+
+    $gpus | Sort-Object FreeVramMb -Descending | Select-Object -First 1
+}
+
+function Get-LlamaAutoTuneRecommendation {
+    param(
+        [Parameter(Mandatory = $true)]$Hardware,
+        [Parameter(Mandatory = $true)]$Model,
+        [string]$Profile = 'Balanced'
+    )
+
+    $gpu = Get-PrimaryGpuInfo -Hardware $Hardware
+    $threads = [Math]::Max(1, [int]$Hardware.LogicalThreads)
+    $recommendedThreads = if ($threads -le 4) { [Math]::Max(1, $threads - 1) } else { [Math]::Min(16, [Math]::Max(2, $threads - 2)) }
+    $freeVramGb = if ($gpu) { [math]::Round($gpu.FreeVramMb / 1024, 2) } else { 0 }
+    $totalVramGb = if ($gpu) { [math]::Round($gpu.TotalVramMb / 1024, 2) } else { 0 }
+    $modelGb = [double]$Model.SizeGb
+    $usableVramGb = [math]::Max(0, ($freeVramGb - 1.5) * 0.88)
+    $blockCount = if ($Model.BlockCount) { [int]$Model.BlockCount } else { 0 }
+
+    $gpuLayers = 0
+    if ($gpu -and $modelGb -gt 0) {
+        if ($modelGb -le $usableVramGb) {
+            $gpuLayers = 999
+        } elseif ($blockCount -gt 0) {
+            $gpuLayers = [math]::Max(0, [math]::Min($blockCount, [math]::Floor($blockCount * ($usableVramGb / $modelGb))))
+        } elseif ($usableVramGb -gt 0) {
+            $gpuLayers = [math]::Max(0, [math]::Floor(80 * ($usableVramGb / $modelGb)))
+        }
+    }
+
+    $ctx = 8192
+    if (($totalVramGb -ge 16) -and ($Hardware.TotalRamGb -ge 32)) { $ctx = 16384 }
+    if (($totalVramGb -ge 24) -and ($Hardware.TotalRamGb -ge 64)) { $ctx = 32768 }
+    if ($Model.ContextLength -and $Model.ContextLength -lt $ctx) { $ctx = [int]$Model.ContextLength }
+
+    $batch = 128
+    $ubatch = 64
+    if ($totalVramGb -ge 12) { $batch = 256; $ubatch = 128 }
+    if ($totalVramGb -ge 24) { $batch = 512; $ubatch = 256 }
+
+    $noMmapEnabled = ($Hardware.FreeRamGb -gt ($modelGb * 1.4 + 8))
+    $nCpuMoeEnabled = [bool]$Model.IsLikelyMoe
+    $nCpuMoe = if ($nCpuMoeEnabled) { [math]::Max(0, [math]::Floor($recommendedThreads / 2)) } else { 0 }
+
+    $speedHint = 'Unknown. Run a short benchmark for a real number.'
+    if ($gpu -and $modelGb -gt 0) {
+        $name = [string]$gpu.Name
+        $tier = 60
+        if ($name -match '(?i)5090|4090') { $tier = 180 }
+        elseif ($name -match '(?i)5080|4080|3090') { $tier = 125 }
+        elseif ($name -match '(?i)5070|4070|3080') { $tier = 85 }
+        elseif ($name -match '(?i)5060|4060|3070') { $tier = 55 }
+        elseif ($name -match '(?i)3060|2070|2060') { $tier = 35 }
+        $center = [math]::Max(1, [math]::Round($tier / [math]::Max(1.5, $modelGb), 1))
+        $low = [math]::Max(1, [math]::Round($center * 0.55, 1))
+        $high = [math]::Round($center * 1.45, 1)
+        $speedHint = "$low-$high tok/s rough decode estimate. Benchmark to calibrate."
+    }
+
+    [pscustomobject]@{
+        Profile        = $Profile
+        GpuName        = if ($gpu) { $gpu.Name } else { 'none' }
+        FreeVramGb     = $freeVramGb
+        ModelSizeGb    = $modelGb
+        SpeedHint      = $speedHint
+        Params         = [ordered]@{
+            '--threads'        = @{ Enabled = $true; Value = [string]$recommendedThreads }
+            '--n-gpu-layers'   = @{ Enabled = ($gpuLayers -gt 0); Value = [string]$gpuLayers }
+            '--ctx-size'       = @{ Enabled = $true; Value = [string]$ctx }
+            '--batch-size'     = @{ Enabled = $true; Value = [string]$batch }
+            '--ubatch-size'    = @{ Enabled = $true; Value = [string]$ubatch }
+            '--cache-type-k'   = @{ Enabled = $true; Value = 'q4_0' }
+            '--cache-type-v'   = @{ Enabled = $true; Value = 'q5_0' }
+            '--flash-attn'     = @{ Enabled = $true; Value = 'on' }
+            '--no-mmap'        = @{ Enabled = $noMmapEnabled; Value = '' }
+            '--cache-ram'      = @{ Enabled = $true; Value = '0' }
+            '--parallel'       = @{ Enabled = $true; Value = '1' }
+            '--n-cpu-moe'      = @{ Enabled = $nCpuMoeEnabled; Value = [string]$nCpuMoe }
+        }
+        Notes          = @(
+            'Balanced profile favors stable startup over maximum possible VRAM usage.',
+            'Token/s is a rough estimate based on GPU name and model size, not a benchmark.',
+            'Increase n-gpu-layers when VRAM remains free; decrease it if loading fails or Windows becomes unstable.',
+            'For vision models, select the matching MMProj file manually.'
+        )
+    }
+}
+
+function Format-LlamaHardwareReport {
+    param([Parameter(Mandatory = $true)]$Hardware)
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add('Hardware')
+    $lines.Add("CPU: $($Hardware.CpuName)")
+    $lines.Add("Logical threads: $($Hardware.LogicalThreads)")
+    $lines.Add("RAM: $($Hardware.FreeRamGb) GB free / $($Hardware.TotalRamGb) GB total")
+    if (@($Hardware.Gpus).Count -eq 0) {
+        $lines.Add('GPU: NVIDIA GPU not detected by nvidia-smi')
+    } else {
+        foreach ($gpu in @($Hardware.Gpus)) {
+            $lines.Add("GPU: $($gpu.Name), VRAM $([math]::Round($gpu.FreeVramMb / 1024, 2)) GB free / $([math]::Round($gpu.TotalVramMb / 1024, 2)) GB total, driver $($gpu.DriverVersion)")
+        }
+    }
+    $lines.Add('')
+    $lines -join [Environment]::NewLine
+}
+
+function Format-LlamaModelReport {
+    param([Parameter(Mandatory = $true)]$Model)
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add('Model')
+    if (-not $Model.ModelPath) {
+        $lines.Add('Model path: not set')
+    } else {
+        $lines.Add("Model path: $($Model.ModelPath)")
+        $lines.Add("Exists: $($Model.ModelExists)")
+        $lines.Add("Size: $($Model.SizeGb) GB")
+        $lines.Add("Architecture: $(if ($Model.Architecture) { $Model.Architecture } else { 'unknown' })")
+        $lines.Add("Quantization: $(if ($Model.Quantization) { $Model.Quantization } else { 'unknown' })")
+        $lines.Add("Block count: $(if ($Model.BlockCount) { $Model.BlockCount } else { 'unknown' })")
+        $lines.Add("Native context: $(if ($Model.ContextLength) { $Model.ContextLength } else { 'unknown' })")
+        $lines.Add("Likely MoE: $($Model.IsLikelyMoe)")
+        $lines.Add("Likely vision: $($Model.IsLikelyVision)")
+    }
+
+    if ($Model.MmprojPath) {
+        $lines.Add("MMProj path: $($Model.MmprojPath)")
+        $lines.Add("MMProj exists: $($Model.MmprojExists)")
+    } else {
+        $lines.Add('MMProj path: not set')
+    }
+
+    if ($Model.MetadataError) {
+        $lines.Add("Metadata note: $($Model.MetadataError)")
+    }
+
+    $lines.Add('')
+    $lines -join [Environment]::NewLine
+}
+
+function Format-LlamaRecommendationReport {
+    param([Parameter(Mandatory = $true)]$Recommendation)
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("Auto Tune: $($Recommendation.Profile)")
+    $lines.Add("Primary GPU: $($Recommendation.GpuName)")
+    $lines.Add("Free VRAM: $($Recommendation.FreeVramGb) GB")
+    $lines.Add("Model size: $($Recommendation.ModelSizeGb) GB")
+    $lines.Add("Speed: $($Recommendation.SpeedHint)")
+    $lines.Add('Recommended params:')
+    foreach ($key in $Recommendation.Params.Keys) {
+        $item = $Recommendation.Params[$key]
+        $valueText = if ($item.Value -ne '') { " $($item.Value)" } else { '' }
+        $state = if ($item.Enabled) { 'on' } else { 'off' }
+        $lines.Add("  $key$valueText [$state]")
+    }
+    foreach ($note in @($Recommendation.Notes)) {
+        $lines.Add("Note: $note")
+    }
+    $lines.Add('')
+    $lines -join [Environment]::NewLine
+}
+
+function Format-LlamaParameterHelp {
+    $items = @(
+        @{ Name = '--n-gpu-layers'; Text = 'How many model layers to load on GPU. Higher is usually faster, but uses more VRAM. Use 999 to try full offload.' }
+        @{ Name = '--ctx-size'; Text = 'Context window. Larger context allows longer prompts/history, but KV cache memory grows with this value.' }
+        @{ Name = '--batch-size'; Text = 'Prompt processing batch size. Higher can improve prefill speed, but may use more VRAM.' }
+        @{ Name = '--ubatch-size'; Text = 'Micro-batch size. Lower it if batch-size causes VRAM spikes or instability.' }
+        @{ Name = '--cache-type-k/v'; Text = 'KV cache precision. q4_0/q5_0 saves VRAM; f16 uses more memory and may be marginally higher fidelity.' }
+        @{ Name = '--flash-attn'; Text = 'Flash attention. Usually keep on for modern NVIDIA GPUs; turn off only if loading or generation fails.' }
+        @{ Name = '--no-mmap'; Text = 'Load model into RAM instead of memory mapping. Can be stable/fast with enough RAM; turn off if RAM is tight.' }
+        @{ Name = '--threads'; Text = 'CPU worker threads. More is not always faster; leave a few threads for Windows and background work.' }
+        @{ Name = '--n-cpu-moe'; Text = 'For MoE models, controls expert work kept on CPU. Useful when VRAM is tight; model-specific.' }
+        @{ Name = '--parallel'; Text = 'Number of parallel slots. Keep 1 for single-user local chat and lower memory use.' }
+        @{ Name = '--mmproj'; Text = 'Multimodal projector path for vision models. Must match the model family/version.' }
+    )
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add('Parameter help')
+    foreach ($item in $items) {
+        $lines.Add("$($item.Name): $($item.Text)")
+    }
+    $lines.Add('')
+    $lines -join [Environment]::NewLine
 }
 
 function Clear-DirectorySafe {
@@ -538,6 +1129,12 @@ function Get-LlamaServerArguments {
         $modelPath = Resolve-LocalPath -Path ([string]$Config.ModelPath)
         $args.Add('-m')
         $args.Add($modelPath)
+    }
+
+    if (($Config.PSObject.Properties.Name -contains 'MmprojPath') -and $Config.MmprojPath) {
+        $mmprojPath = Resolve-LocalPath -Path ([string]$Config.MmprojPath)
+        $args.Add('--mmproj')
+        $args.Add($mmprojPath)
     }
 
     foreach ($param in @($Config.Params)) {

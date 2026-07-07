@@ -309,6 +309,10 @@ function Drain-ProcessLogs {
 function Collect-ConfigFromUi {
     Write-GuiLog 'Collecting config from UI'
     $script:config.ModelPath = $script:modelBox.Text
+    if (-not ($script:config.PSObject.Properties.Name -contains 'MmprojPath')) {
+        $script:config | Add-Member -NotePropertyName MmprojPath -NotePropertyValue ''
+    }
+    $script:config.MmprojPath = $script:mmprojBox.Text
     $script:config.TargetDir = $script:targetBox.Text
     $script:config.TmpDir = $script:tmpBox.Text
 
@@ -422,6 +426,51 @@ function Start-ToolCommand {
     Set-UiStatus "$Title running"
 }
 
+function Get-CurrentModelInfo {
+    $mmprojPath = ''
+    if ($script:config.PSObject.Properties.Name -contains 'MmprojPath') {
+        $mmprojPath = [string]$script:config.MmprojPath
+    }
+
+    Get-LlamaModelInfo -ModelPath ([string]$script:config.ModelPath) -MmprojPath $mmprojPath
+}
+
+function Set-ParamUiValue {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][bool]$Enabled,
+        [AllowEmptyString()][string]$Value
+    )
+
+    $param = Get-LlamaParam -Config $script:config -Name $Name
+    if ($param) {
+        $param.Enabled = $Enabled
+        if ([string]$param.Type -ne 'switch') {
+            $param.Value = $Value
+        }
+    }
+
+    if ($script:paramControls.ContainsKey($Name)) {
+        $controls = $script:paramControls[$Name]
+        $controls.EnabledBox.Checked = $Enabled
+        if ($controls.ValueBox -and ($controls.ValueBox.Enabled -or ($controls.ValueBox -is [System.Windows.Forms.ComboBox]))) {
+            $controls.ValueBox.Text = $Value
+        }
+    }
+}
+
+function Apply-RecommendationToUi {
+    param([Parameter(Mandatory = $true)]$Recommendation)
+
+    foreach ($name in $Recommendation.Params.Keys) {
+        $item = $Recommendation.Params[$name]
+        Set-ParamUiValue -Name $name -Enabled ([bool]$item.Enabled) -Value ([string]$item.Value)
+    }
+
+    Save-LocalLlamaConfig -Config $script:config
+    [void](Export-LlamaServerCmd -Config $script:config)
+}
+
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'llamacppWindowAutoRun'
 $form.StartPosition = 'CenterScreen'
@@ -432,8 +481,8 @@ $main = New-Object System.Windows.Forms.TableLayoutPanel
 $main.Dock = 'Fill'
 $main.ColumnCount = 1
 $main.RowCount = 4
-$main.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 116))) | Out-Null
-$main.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 58))) | Out-Null
+$main.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 148))) | Out-Null
+$main.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 92))) | Out-Null
 $main.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 48))) | Out-Null
 $main.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 52))) | Out-Null
 $form.Controls.Add($main)
@@ -441,7 +490,7 @@ $form.Controls.Add($main)
 $paths = New-Object System.Windows.Forms.TableLayoutPanel
 $paths.Dock = 'Fill'
 $paths.ColumnCount = 4
-$paths.RowCount = 3
+$paths.RowCount = 4
 $paths.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 90))) | Out-Null
 $paths.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100))) | Out-Null
 $paths.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 100))) | Out-Null
@@ -454,6 +503,13 @@ $script:modelBox.Text = [string]$script:config.ModelPath
 $script:modelBox.Margin = New-Object System.Windows.Forms.Padding(4, 6, 4, 2)
 $browseModelButton = New-Button 'Browse'
 $browseModelButton.Width = 88
+
+$script:mmprojBox = New-Object System.Windows.Forms.TextBox
+$script:mmprojBox.Dock = 'Fill'
+$script:mmprojBox.Text = if ($script:config.PSObject.Properties.Name -contains 'MmprojPath') { [string]$script:config.MmprojPath } else { '' }
+$script:mmprojBox.Margin = New-Object System.Windows.Forms.Padding(4, 6, 4, 2)
+$browseMmprojButton = New-Button 'Browse'
+$browseMmprojButton.Width = 88
 
 $script:targetBox = New-Object System.Windows.Forms.TextBox
 $script:targetBox.Dock = 'Fill'
@@ -475,20 +531,27 @@ $paths.Controls.Add((New-Label 'Model'), 0, 0)
 $paths.Controls.Add($script:modelBox, 1, 0)
 $paths.Controls.Add($browseModelButton, 2, 0)
 $paths.Controls.Add($script:statusLabel, 3, 0)
-$paths.Controls.Add((New-Label 'Target'), 0, 1)
-$paths.Controls.Add($script:targetBox, 1, 1)
+$paths.Controls.Add((New-Label 'MMProj'), 0, 1)
+$paths.Controls.Add($script:mmprojBox, 1, 1)
+$paths.Controls.Add($browseMmprojButton, 2, 1)
+$paths.Controls.Add((New-Label 'Target'), 0, 2)
+$paths.Controls.Add($script:targetBox, 1, 2)
 $paths.SetColumnSpan($script:targetBox, 2)
-$paths.Controls.Add((New-Label 'Temp'), 0, 2)
-$paths.Controls.Add($script:tmpBox, 1, 2)
+$paths.Controls.Add((New-Label 'Temp'), 0, 3)
+$paths.Controls.Add($script:tmpBox, 1, 3)
 $paths.SetColumnSpan($script:tmpBox, 2)
 
 $buttonPanel = New-Object System.Windows.Forms.FlowLayoutPanel
 $buttonPanel.Dock = 'Fill'
 $buttonPanel.FlowDirection = 'LeftToRight'
-$buttonPanel.WrapContents = $false
+$buttonPanel.WrapContents = $true
 $buttonPanel.Padding = New-Object System.Windows.Forms.Padding(4)
 $main.Controls.Add($buttonPanel, 0, 1)
 
+$hardwareButton = New-Button 'Hardware'
+$modelButton = New-Button 'Model Info'
+$autoTuneButton = New-Button 'Auto Tune'
+$helpButton = New-Button 'Param Help'
 $checkButton = New-Button 'Check Update'
 $updateButton = New-Button 'Install/Update'
 $startButton = New-Button 'Start Server'
@@ -497,7 +560,7 @@ $saveButton = New-Button 'Save'
 $cmdButton = New-Button 'Generate CMD'
 $clearConsoleButton = New-Button 'Clear Console'
 
-@($checkButton, $updateButton, $startButton, $stopButton, $saveButton, $cmdButton, $clearConsoleButton) | ForEach-Object {
+@($hardwareButton, $modelButton, $autoTuneButton, $helpButton, $checkButton, $updateButton, $startButton, $stopButton, $saveButton, $cmdButton, $clearConsoleButton) | ForEach-Object {
     $buttonPanel.Controls.Add($_)
 }
 
@@ -588,6 +651,59 @@ $script:processTimer.Add_Tick({
 })
 $script:processTimer.Start()
 
+$hardwareButton.Add_Click({
+    Invoke-GuiAction 'Analyze hardware' {
+    $script:console.Clear()
+    $hardware = Get-LlamaHardwareInfo
+    Append-Console (Format-LlamaHardwareReport -Hardware $hardware)
+    Set-UiStatus 'Hardware analyzed'
+    }
+})
+
+$modelButton.Add_Click({
+    Invoke-GuiAction 'Analyze model' {
+    Collect-ConfigFromUi
+    $script:console.Clear()
+    $model = Get-CurrentModelInfo
+    Append-Console (Format-LlamaModelReport -Model $model)
+    Set-UiStatus 'Model analyzed'
+    }
+})
+
+$autoTuneButton.Add_Click({
+    Invoke-GuiAction 'Auto tune balanced' {
+    Collect-ConfigFromUi
+    $script:console.Clear()
+    $hardware = Get-LlamaHardwareInfo
+    $model = Get-CurrentModelInfo
+    Append-Console (Format-LlamaHardwareReport -Hardware $hardware)
+    Append-Console (Format-LlamaModelReport -Model $model)
+    if (-not $model.ModelPath) {
+        Append-Console "Auto Tune skipped: select a model first." + [Environment]::NewLine
+        Set-UiStatus 'Model path required'
+        return
+    }
+    if (-not $model.ModelExists) {
+        Append-Console "Auto Tune skipped: model file was not found." + [Environment]::NewLine
+        Set-UiStatus 'Model not found'
+        return
+    }
+    $recommendation = Get-LlamaAutoTuneRecommendation -Hardware $hardware -Model $model -Profile 'Balanced'
+    Apply-RecommendationToUi -Recommendation $recommendation
+    Append-Console (Format-LlamaRecommendationReport -Recommendation $recommendation)
+    Append-Console "Applied Balanced recommendation and saved local config." + [Environment]::NewLine
+    Set-UiStatus 'Auto tune applied'
+    }
+})
+
+$helpButton.Add_Click({
+    Invoke-GuiAction 'Parameter help' {
+    $script:console.Clear()
+    Append-Console (Format-LlamaParameterHelp)
+    Set-UiStatus 'Parameter help'
+    }
+})
+
 $browseModelButton.Add_Click({
     Invoke-GuiAction 'Browse model' {
     $dialog = New-Object System.Windows.Forms.OpenFileDialog
@@ -598,6 +714,20 @@ $browseModelButton.Add_Click({
     }
     if ($dialog.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
         $script:modelBox.Text = $dialog.FileName
+    }
+    }
+})
+
+$browseMmprojButton.Add_Click({
+    Invoke-GuiAction 'Browse MMProj' {
+    $dialog = New-Object System.Windows.Forms.OpenFileDialog
+    $dialog.Filter = 'MMProj files (*.gguf)|*.gguf|All files (*.*)|*.*'
+    $dialog.Title = 'Select MMProj'
+    if ($script:mmprojBox.Text -and (Test-Path -LiteralPath (Split-Path $script:mmprojBox.Text -Parent))) {
+        $dialog.InitialDirectory = Split-Path $script:mmprojBox.Text -Parent
+    }
+    if ($dialog.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
+        $script:mmprojBox.Text = $dialog.FileName
     }
     }
 })
@@ -656,6 +786,15 @@ $startButton.Add_Click({
         Append-Console ("Model file not found: $modelPath" + [Environment]::NewLine)
         Set-UiStatus 'Model not found'
         return
+    }
+
+    if (($script:config.PSObject.Properties.Name -contains 'MmprojPath') -and -not [string]::IsNullOrWhiteSpace([string]$script:config.MmprojPath)) {
+        $mmprojPath = Resolve-LocalPath -Path ([string]$script:config.MmprojPath)
+        if (-not (Test-Path -LiteralPath $mmprojPath)) {
+            Append-Console ("MMProj file not found: $mmprojPath" + [Environment]::NewLine)
+            Set-UiStatus 'MMProj not found'
+            return
+        }
     }
 
     $targetDir = Resolve-LocalPath -Path $script:config.TargetDir

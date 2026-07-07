@@ -14,6 +14,7 @@
 - 写入安装信息到 `llamacpp/install.info`、`versions/*.info` 和 `install.log`。
 - 如果 `llama-server.exe` 正在从目标目录运行，会阻止更新，避免清空正在使用的目录。
 - 提供 WinForms 图形界面，可以选择模型、开关参数、检查更新、安装更新、启动 server，并在下方 console 查看实时输出。
+- 提供硬件分析、模型分析、参数说明和 Balanced 自动推荐。
 - 只依赖 Windows PowerShell 和系统自带 .NET WinForms。
 
 ## 要求
@@ -38,7 +39,8 @@
   "LogPath": "install.log",
   "CudaMajor": "13",
   "CudaDlls": "13.3",
-  "ModelPath": ""
+  "ModelPath": "",
+  "MmprojPath": ""
 }
 ```
 
@@ -57,6 +59,12 @@ CUDA 版本需要你自己填写：
 如果找不到精确的 `CudaDlls` 版本，脚本会尝试在同一个 `CudaMajor` 下选择最新的可用版本。
 
 `ModelPath` 可以在 GUI 中选择，也可以写在 `conf/user.config.json` 或 `conf/config.json` 里。它可以是绝对路径，也可以是相对于项目 clone 目录的路径。不要把私人模型路径或模型文件提交到 GitHub。
+
+`MmprojPath` 是可选项。只有模型需要 multimodal projector 时才填写。填写后启动器会把它传给 `llama-server.exe`：
+
+```cmd
+--mmproj <path-to-mmproj>
+```
 
 ## 使用
 
@@ -85,6 +93,25 @@ Start-LlamaServer.cmd
 ```
 
 GUI 也可以生成一个直接启动 `llama-server.exe` 的 `Start-LlamaServer.generated.cmd`。这个生成文件会被 Git 忽略，因为它可能包含本机模型路径。
+
+## 硬件分析、模型分析和 Auto Tune
+
+GUI 里有这些工具按钮：
+
+- `Hardware`：检测 CPU 线程数、系统 RAM，并在可用时通过 `nvidia-smi` 检测 NVIDIA GPU 和 VRAM。
+- `Model Info`：读取模型大小、文件名里的量化信息，并尽量读取 GGUF metadata，例如架构、层数、原生 context。
+- `Auto Tune`：应用 Balanced 推荐参数，包括 `--threads`、`--n-gpu-layers`、`--ctx-size`、batch、ubatch、KV cache、flash attention、mmap、parallel 和 MoE 相关 CPU 设置。
+- `Param Help`：输出常用 `llama-server.exe` 参数说明。
+
+Auto Tune 里的速度预测是粗略估算，不是真实 benchmark。它只根据 GPU 名称和模型大小给一个起点。最终还是要看实际 token/s、VRAM 和 RAM 占用来微调。
+
+优化建议：
+
+- 加载后 VRAM 还有余量时，可以增加 `--n-gpu-layers`。
+- 如果加载失败或系统不稳定，降低 `--n-gpu-layers`、`--batch-size` 或 `--ubatch-size`。
+- 只有确实需要长上下文时再增加 `--ctx-size`，它会增加 KV cache 内存。
+- 现代 NVIDIA GPU 通常保持 `--flash-attn on`，除非它导致报错。
+- 只有视觉/多模态模型才填写 `MmprojPath`，并确认 mmproj 和模型家族匹配。
 
 ## 更新行为
 

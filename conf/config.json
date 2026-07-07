@@ -9,6 +9,7 @@
   "CudaMajor": "13",
   "CudaDlls": "13.3",
   "ModelPath": "",
+  "MmprojPath": "",
   "Params": [
     { "Name": "--host", "Enabled": true, "Value": "127.0.0.1", "Type": "value" },
     { "Name": "--port", "Enabled": true, "Value": "8080", "Type": "value" },

@@ -26,6 +26,14 @@ if (-not (Test-Path -LiteralPath $modelPath)) {
     exit 1
 }
 
+if (($config.PSObject.Properties.Name -contains 'MmprojPath') -and -not [string]::IsNullOrWhiteSpace([string]$config.MmprojPath)) {
+    $mmprojPath = Resolve-LocalPath -Path ([string]$config.MmprojPath)
+    if (-not (Test-Path -LiteralPath $mmprojPath)) {
+        Write-Error "MMProj file not found: $mmprojPath"
+        exit 1
+    }
+}
+
 if (-not (Test-Path -LiteralPath $exe)) {
     Write-Error "llama-server.exe not found: $exe. Run Update-LlamaCpp.cmd first."
     exit 1
