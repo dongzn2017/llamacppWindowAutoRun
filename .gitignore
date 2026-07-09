@@ -13,6 +13,7 @@
 # Local user config, launchers, and model files
 /conf/user.config.json
 /Start-LlamaServer.generated.cmd
+/Start-LlamaServer.*.generated.cmd
 /models/
 *.gguf
 *.safetensors

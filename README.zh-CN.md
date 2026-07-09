@@ -14,7 +14,7 @@
 - 写入安装信息到 `llamacpp/install.info`、`versions/*.info` 和 `install.log`。
 - 如果 `llama-server.exe` 正在从目标目录运行，会阻止更新，避免清空正在使用的目录。
 - 提供 WinForms 图形界面，可以选择模型、开关参数、检查更新、安装更新、启动 server，并在下方 console 查看实时输出。
-- 提供硬件分析、模型分析、参数说明和 Balanced 自动推荐。
+- 提供硬件分析、模型分析、详细参数说明、Balanced 静态推荐，以及基于 `llama-bench.exe` 的实际 benchmark tune。
 - 只依赖 Windows PowerShell 和系统自带 .NET WinForms。
 
 ## 要求
@@ -92,7 +92,7 @@ Update-LlamaCpp.cmd
 Start-LlamaServer.cmd
 ```
 
-GUI 也可以生成一个直接启动 `llama-server.exe` 的 `Start-LlamaServer.generated.cmd`。这个生成文件会被 Git 忽略，因为它可能包含本机模型路径。
+GUI 也可以生成类似 `Start-LlamaServer.<模型名>.generated.cmd` 的直接启动器，并同步刷新 `Start-LlamaServer.generated.cmd` 作为当前配置别名。生成文件会被 Git 忽略，因为它可能包含本机模型路径。
 
 ## 硬件分析、模型分析和 Auto Tune
 
@@ -100,10 +100,11 @@ GUI 里有这些工具按钮：
 
 - `Hardware`：检测 CPU 线程数、系统 RAM，并在可用时通过 `nvidia-smi` 检测 NVIDIA GPU 和 VRAM。
 - `Model Info`：读取模型大小、文件名里的量化信息，并尽量读取 GGUF metadata，例如架构、层数、原生 context。
-- `Auto Tune`：应用 Balanced 推荐参数，包括 `--threads`、`--n-gpu-layers`、`--ctx-size`、batch、ubatch、KV cache、flash attention、mmap、parallel 和 MoE 相关 CPU 设置。
-- `Param Help`：输出常用 `llama-server.exe` 参数说明。
+- `Auto Tune`：应用 Balanced 静态推荐参数，包括 `--threads`、`--n-gpu-layers`、`--ctx-size`、batch、ubatch、KV cache、flash attention、mmap、parallel 和 MoE 相关 CPU 设置。
+- `Benchmark Tune`：调用 `llama-bench.exe`，用几组候选 GPU layers、batch、ubatch、CPU threads、KV cache、flash attention、mmap 和 MoE 参数实际加载模型测试。测试结束后会尝试解析最佳结果并应用到 GUI。
+- `Param Help`：输出更详细的 `llama-server.exe` 参数说明，包括什么时候增加、什么时候降低。
 
-Auto Tune 里的速度预测是粗略估算，不是真实 benchmark。它只根据 GPU 名称和模型大小给一个起点。最终还是要看实际 token/s、VRAM 和 RAM 占用来微调。
+Auto Tune 里的速度预测是粗略估算，不是真实 benchmark。它只根据 GPU 名称和模型大小给一个起点。需要真实加载测试时，用 Benchmark Tune。
 
 优化建议：
 
@@ -112,6 +113,8 @@ Auto Tune 里的速度预测是粗略估算，不是真实 benchmark。它只根
 - 只有确实需要长上下文时再增加 `--ctx-size`，它会增加 KV cache 内存。
 - 现代 NVIDIA GPU 通常保持 `--flash-attn on`，除非它导致报错。
 - 只有视觉/多模态模型才填写 `MmprojPath`，并确认 mmproj 和模型家族匹配。
+- Benchmark Tune 会花时间，也可能因为某个候选参数爆 VRAM 而失败。看 GUI console 输出，再降低 GPU layers 或 batch。
+- Benchmark Tune 不会自动调 `--ctx-size`；当前 `llama-bench.exe` 可以测试 prompt/generation 参数，但没有暴露和 server 相同的 context-size 参数。
 
 ## 更新行为
 

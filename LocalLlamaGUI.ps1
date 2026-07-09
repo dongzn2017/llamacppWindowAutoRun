@@ -113,6 +113,7 @@ $script:serverProcess = $null
 $script:toolProcess = $null
 $script:paramControls = @{}
 $script:processLogs = New-Object System.Collections.ArrayList
+$script:lastGeneratedCmd = $null
 
 if ($SelfTest) {
     Write-GuiLog "SelfTest OK. TargetDir=$($script:config.TargetDir) TmpDir=$($script:config.TmpDir)"
@@ -330,7 +331,7 @@ function Collect-ConfigFromUi {
     }
 
     Save-LocalLlamaConfig -Config $script:config
-    [void](Export-LlamaServerCmd -Config $script:config)
+    $script:lastGeneratedCmd = Export-LlamaServerCmd -Config $script:config
     Write-GuiLog 'Config saved and generated launcher updated'
 }
 
@@ -340,7 +341,8 @@ function Start-ManagedProcess {
         [string[]]$Arguments,
         [string]$WorkingDirectory,
         [Parameter(Mandatory = $true)][string]$Name,
-        [scriptblock]$OnExit
+        [scriptblock]$OnExit,
+        [System.Text.StringBuilder]$CaptureOutput
     )
 
     Write-GuiLog "Starting process [$Name]: $FileName $(ConvertTo-WindowsArgumentString -Arguments $Arguments)"
@@ -368,6 +370,9 @@ function Start-ManagedProcess {
 
     $appendAction = [Action[string]]{
         param([string]$Text)
+        if ($null -ne $CaptureOutput) {
+            [void]$CaptureOutput.Append($Text)
+        }
         Append-Console $Text
     }.GetNewClosure()
 
@@ -459,16 +464,22 @@ function Set-ParamUiValue {
     }
 }
 
-function Apply-RecommendationToUi {
-    param([Parameter(Mandatory = $true)]$Recommendation)
+function Apply-ParamMapToUi {
+    param([Parameter(Mandatory = $true)]$ParamMap)
 
-    foreach ($name in $Recommendation.Params.Keys) {
-        $item = $Recommendation.Params[$name]
+    foreach ($name in $ParamMap.Keys) {
+        $item = $ParamMap[$name]
         Set-ParamUiValue -Name $name -Enabled ([bool]$item.Enabled) -Value ([string]$item.Value)
     }
 
     Save-LocalLlamaConfig -Config $script:config
-    [void](Export-LlamaServerCmd -Config $script:config)
+    $script:lastGeneratedCmd = Export-LlamaServerCmd -Config $script:config
+}
+
+function Apply-RecommendationToUi {
+    param([Parameter(Mandatory = $true)]$Recommendation)
+
+    Apply-ParamMapToUi -ParamMap $Recommendation.Params
 }
 
 $form = New-Object System.Windows.Forms.Form
@@ -551,6 +562,7 @@ $main.Controls.Add($buttonPanel, 0, 1)
 $hardwareButton = New-Button 'Hardware'
 $modelButton = New-Button 'Model Info'
 $autoTuneButton = New-Button 'Auto Tune'
+$benchmarkTuneButton = New-Button 'Benchmark Tune'
 $helpButton = New-Button 'Param Help'
 $checkButton = New-Button 'Check Update'
 $updateButton = New-Button 'Install/Update'
@@ -560,7 +572,7 @@ $saveButton = New-Button 'Save'
 $cmdButton = New-Button 'Generate CMD'
 $clearConsoleButton = New-Button 'Clear Console'
 
-@($hardwareButton, $modelButton, $autoTuneButton, $helpButton, $checkButton, $updateButton, $startButton, $stopButton, $saveButton, $cmdButton, $clearConsoleButton) | ForEach-Object {
+@($hardwareButton, $modelButton, $autoTuneButton, $benchmarkTuneButton, $helpButton, $checkButton, $updateButton, $startButton, $stopButton, $saveButton, $cmdButton, $clearConsoleButton) | ForEach-Object {
     $buttonPanel.Controls.Add($_)
 }
 
@@ -696,6 +708,83 @@ $autoTuneButton.Add_Click({
     }
 })
 
+$benchmarkTuneButton.Add_Click({
+    Invoke-GuiAction 'Benchmark tune' {
+    if ($script:toolProcess -and -not $script:toolProcess.HasExited) {
+        Append-Console "[tool already running]" + [Environment]::NewLine
+        return
+    }
+
+    Collect-ConfigFromUi
+    $script:console.Clear()
+    $hardware = Get-LlamaHardwareInfo
+    $model = Get-CurrentModelInfo
+    Append-Console (Format-LlamaHardwareReport -Hardware $hardware)
+    Append-Console (Format-LlamaModelReport -Model $model)
+
+    if (-not $model.ModelPath) {
+        Append-Console "Benchmark Tune skipped: select a model first." + [Environment]::NewLine
+        Set-UiStatus 'Model path required'
+        return
+    }
+    if (-not $model.ModelExists) {
+        Append-Console "Benchmark Tune skipped: model file was not found." + [Environment]::NewLine
+        Set-UiStatus 'Model not found'
+        return
+    }
+
+    $benchExe = Get-LlamaBenchPath -Config $script:config
+    if (-not (Test-Path -LiteralPath $benchExe)) {
+        Append-Console "llama-bench.exe not found: $benchExe" + [Environment]::NewLine
+        Append-Console "Run Install/Update first." + [Environment]::NewLine
+        Set-UiStatus 'Benchmark tool missing'
+        return
+    }
+
+    $bench = New-LlamaBenchmarkArguments -Config $script:config -Hardware $hardware -Model $model
+    Append-Console ("Benchmark candidates: $($bench.CandidateText)" + [Environment]::NewLine)
+    Append-Console "Running llama-bench. This can take a while and will load the model." + [Environment]::NewLine
+    $capture = New-Object System.Text.StringBuilder
+    $targetDir = Resolve-LocalPath -Path $script:config.TargetDir
+
+    $script:toolProcess = Start-ManagedProcess `
+        -FileName $benchExe `
+        -Arguments $bench.Arguments `
+        -WorkingDirectory $targetDir `
+        -Name 'benchmark' `
+        -CaptureOutput $capture `
+        -OnExit ({
+            param($ExitCode)
+            if ($ExitCode -ne 0) {
+                Append-Console ("Benchmark Tune failed with exit code $ExitCode." + [Environment]::NewLine)
+                Set-UiStatus "Benchmark failed: $ExitCode"
+                return
+            }
+
+            $parsed = ConvertFrom-LlamaBenchmarkOutput -Text $capture.ToString()
+            if (-not $parsed.Parsed) {
+                Append-Console ("Benchmark finished, but output could not be parsed: $($parsed.Error)" + [Environment]::NewLine)
+                Set-UiStatus 'Benchmark parse failed'
+                return
+            }
+
+            $paramResult = Convert-LlamaBenchmarkBestToParams -Best $parsed.Best
+            if ($paramResult.Params.Keys.Count -eq 0) {
+                Append-Console "Benchmark parsed, but no tunable params were found in the best row." + [Environment]::NewLine
+                Set-UiStatus 'Benchmark no params'
+                return
+            }
+
+            Apply-ParamMapToUi -ParamMap $paramResult.Params
+            Append-Console ("Benchmark best score: $($parsed.BestScore) tok/s field" + [Environment]::NewLine)
+            Append-Console "Applied benchmark-derived params and saved local config." + [Environment]::NewLine
+            Set-UiStatus 'Benchmark tune applied'
+        }.GetNewClosure())
+
+    Set-UiStatus 'Benchmark running'
+    }
+})
+
 $helpButton.Add_Click({
     Invoke-GuiAction 'Parameter help' {
     $script:console.Clear()
@@ -748,16 +837,15 @@ $saveButton.Add_Click({
     Invoke-GuiAction 'Save config' {
     Collect-ConfigFromUi
     Set-UiStatus 'Saved'
-    Append-Console ("Saved config and generated Start-LlamaServer.generated.cmd" + [Environment]::NewLine)
+    Append-Console ("Saved config and generated: $script:lastGeneratedCmd" + [Environment]::NewLine)
     }
 })
 
 $cmdButton.Add_Click({
     Invoke-GuiAction 'Generate CMD' {
     Collect-ConfigFromUi
-    $generated = Export-LlamaServerCmd -Config $script:config
     Set-UiStatus 'CMD generated'
-    Append-Console ("Generated: $generated" + [Environment]::NewLine)
+    Append-Console ("Generated: $script:lastGeneratedCmd" + [Environment]::NewLine)
     }
 })
 

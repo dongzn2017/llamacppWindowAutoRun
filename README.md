@@ -14,7 +14,7 @@ This project is intentionally lightweight. It does not bundle `llama.cpp`, CUDA 
 - Writes installed version metadata to `llamacpp/install.info`, `versions/*.info`, and `install.log`.
 - Blocks updates while `llama-server.exe` is running from the target folder.
 - Provides a WinForms GUI for selecting a model, toggling parameters, checking updates, installing updates, and running the server with a live console.
-- Adds hardware/model analysis, parameter help, and a Balanced auto-tune preset.
+- Adds hardware/model analysis, detailed parameter help, a Balanced auto-suggest preset, and an optional llama-bench based benchmark tune.
 - Uses only Windows PowerShell and built-in .NET WinForms.
 
 ## Requirements
@@ -92,7 +92,7 @@ Start `llama-server.exe` with the saved config:
 Start-LlamaServer.cmd
 ```
 
-The GUI can also generate a direct `Start-LlamaServer.generated.cmd` launcher. That generated file is ignored by Git because it may contain local model paths.
+The GUI can also generate direct launchers named like `Start-LlamaServer.<model-name>.generated.cmd`. It also refreshes `Start-LlamaServer.generated.cmd` as the current-config alias. Generated launcher files are ignored by Git because they may contain local model paths.
 
 ## Hardware, Model Analysis, And Auto Tune
 
@@ -100,10 +100,11 @@ The GUI includes these utility buttons:
 
 - `Hardware`: detects CPU threads, system RAM, and NVIDIA GPU VRAM through `nvidia-smi` when available.
 - `Model Info`: reads model size, filename quantization, and basic GGUF metadata such as architecture, block count, and native context when available.
-- `Auto Tune`: applies a Balanced recommendation for `--threads`, `--n-gpu-layers`, `--ctx-size`, batch sizes, KV cache types, flash attention, mmap, parallel slots, and MoE-related CPU settings.
-- `Param Help`: prints concise explanations for important `llama-server.exe` options.
+- `Auto Tune`: applies a Balanced static recommendation for `--threads`, `--n-gpu-layers`, `--ctx-size`, batch sizes, KV cache types, flash attention, mmap, parallel slots, and MoE-related CPU settings.
+- `Benchmark Tune`: runs `llama-bench.exe` with several candidate values for GPU layers, batch size, ubatch size, CPU threads, KV cache, flash attention, mmap, and MoE settings. After the test finishes, it parses the best result it can recognize and applies those parameters.
+- `Param Help`: prints detailed explanations for important `llama-server.exe` options, including when to increase/decrease each setting.
 
-The speed estimate shown by Auto Tune is intentionally rough. It is based on GPU name and model size, not a real benchmark. Use it as a starting point, then adjust after observing actual token/s and VRAM usage.
+The speed estimate shown by Auto Tune is intentionally rough. It is based on GPU name and model size, not a real benchmark. Use Benchmark Tune when you want the tool to actually load the model and test candidate parameters.
 
 Optimization hints:
 
@@ -112,6 +113,8 @@ Optimization hints:
 - Increase `--ctx-size` only when you need longer context; it increases KV cache memory.
 - Keep `--flash-attn on` for modern NVIDIA GPUs unless it causes errors.
 - Use `MmprojPath` only for vision/multimodal models, and make sure it matches the model family.
+- Benchmark Tune can take time and may fail if a candidate exceeds VRAM. Use the console output to see the failing candidate and reduce GPU layers or batch sizes.
+- Benchmark Tune does not tune `--ctx-size`; this `llama-bench.exe` build benchmarks prompt/generation settings but does not expose the same server context-size option.
 
 ## Update Behavior
 

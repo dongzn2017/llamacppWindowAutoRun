@@ -706,26 +706,313 @@ function Format-LlamaRecommendationReport {
     $lines -join [Environment]::NewLine
 }
 
-function Format-LlamaParameterHelp {
-    $items = @(
-        @{ Name = '--n-gpu-layers'; Text = 'How many model layers to load on GPU. Higher is usually faster, but uses more VRAM. Use 999 to try full offload.' }
-        @{ Name = '--ctx-size'; Text = 'Context window. Larger context allows longer prompts/history, but KV cache memory grows with this value.' }
-        @{ Name = '--batch-size'; Text = 'Prompt processing batch size. Higher can improve prefill speed, but may use more VRAM.' }
-        @{ Name = '--ubatch-size'; Text = 'Micro-batch size. Lower it if batch-size causes VRAM spikes or instability.' }
-        @{ Name = '--cache-type-k/v'; Text = 'KV cache precision. q4_0/q5_0 saves VRAM; f16 uses more memory and may be marginally higher fidelity.' }
-        @{ Name = '--flash-attn'; Text = 'Flash attention. Usually keep on for modern NVIDIA GPUs; turn off only if loading or generation fails.' }
-        @{ Name = '--no-mmap'; Text = 'Load model into RAM instead of memory mapping. Can be stable/fast with enough RAM; turn off if RAM is tight.' }
-        @{ Name = '--threads'; Text = 'CPU worker threads. More is not always faster; leave a few threads for Windows and background work.' }
-        @{ Name = '--n-cpu-moe'; Text = 'For MoE models, controls expert work kept on CPU. Useful when VRAM is tight; model-specific.' }
-        @{ Name = '--parallel'; Text = 'Number of parallel slots. Keep 1 for single-user local chat and lower memory use.' }
-        @{ Name = '--mmproj'; Text = 'Multimodal projector path for vision models. Must match the model family/version.' }
+function Get-LlamaBenchPath {
+    param([Parameter(Mandatory = $true)]$Config)
+
+    $targetDir = Resolve-LocalPath -Path ([string]$Config.TargetDir)
+    Join-Path $targetDir 'llama-bench.exe'
+}
+
+function Join-UniqueCsv {
+    param([object[]]$Values)
+
+    (@($Values) | Where-Object { $null -ne $_ -and [string]$_ -ne '' } | ForEach-Object { [string]$_ } | Select-Object -Unique) -join ','
+}
+
+function New-LlamaBenchmarkArguments {
+    param(
+        [Parameter(Mandatory = $true)]$Config,
+        [Parameter(Mandatory = $true)]$Hardware,
+        [Parameter(Mandatory = $true)]$Model
     )
 
+    $recommendation = Get-LlamaAutoTuneRecommendation -Hardware $Hardware -Model $Model -Profile 'Balanced'
+    $params = $recommendation.Params
+    $modelPath = Resolve-LocalPath -Path ([string]$Config.ModelPath)
+    $threads = [int]$params['--threads'].Value
+    $batch = [int]$params['--batch-size'].Value
+    $ubatch = [int]$params['--ubatch-size'].Value
+    $ngl = if ($params['--n-gpu-layers'].Enabled) { [int]$params['--n-gpu-layers'].Value } else { 0 }
+    $blockCount = if ($Model.BlockCount) { [int]$Model.BlockCount } else { 0 }
+
+    $nglCandidates = @()
+    if ($ngl -ge 999) {
+        $nglCandidates += 999
+        if ($blockCount -gt 8) {
+            $nglCandidates += [math]::Max(0, $blockCount - 4)
+        }
+    } else {
+        $nglCandidates += [math]::Max(0, $ngl)
+        $nglCandidates += [math]::Max(0, $ngl - 8)
+        if ($blockCount -gt 0) {
+            $nglCandidates += [math]::Min($blockCount, $ngl + 8)
+        } else {
+            $nglCandidates += [math]::Max(0, $ngl + 8)
+        }
+    }
+
+    $batchCandidates = @($batch)
+    if ($batch -gt 128) { $batchCandidates += [math]::Max(64, [int]($batch / 2)) }
+    if ($batch -lt 512) { $batchCandidates += [math]::Min(512, $batch * 2) }
+
+    $ubatchCandidates = @($ubatch)
+    if ($ubatch -gt 64) { $ubatchCandidates += [math]::Max(32, [int]($ubatch / 2)) }
+
+    $maxThreads = [Math]::Max(1, [int]$Hardware.LogicalThreads)
+    $threadCandidates = @($threads)
+    if ($threads -gt 4) { $threadCandidates += [math]::Max(1, $threads - 2) }
+    if ($threads -lt $maxThreads) { $threadCandidates += [math]::Min($maxThreads, $threads + 2) }
+
+    $mmap = if ($params['--no-mmap'].Enabled) { '0' } else { '1' }
+    $nCpuMoe = if ($params['--n-cpu-moe'].Enabled) { [string]$params['--n-cpu-moe'].Value } else { '0' }
+
+    $args = @(
+        '-m', $modelPath,
+        '-o', 'json',
+        '-r', '1',
+        '-p', '256',
+        '-n', '64',
+        '-t', (Join-UniqueCsv -Values $threadCandidates),
+        '-ngl', (Join-UniqueCsv -Values $nglCandidates),
+        '-b', (Join-UniqueCsv -Values $batchCandidates),
+        '-ub', (Join-UniqueCsv -Values $ubatchCandidates),
+        '-ctk', [string]$params['--cache-type-k'].Value,
+        '-ctv', [string]$params['--cache-type-v'].Value,
+        '-fa', [string]$params['--flash-attn'].Value,
+        '-mmp', $mmap,
+        '-ncmoe', $nCpuMoe
+    )
+
+    [pscustomobject]@{
+        Arguments      = [string[]]$args
+        Recommendation = $recommendation
+        CandidateText  = "ngl=$(Join-UniqueCsv -Values $nglCandidates), batch=$(Join-UniqueCsv -Values $batchCandidates), ubatch=$(Join-UniqueCsv -Values $ubatchCandidates), threads=$(Join-UniqueCsv -Values $threadCandidates)"
+    }
+}
+
+function Get-PropertyValueByName {
+    param(
+        [Parameter(Mandatory = $true)]$Object,
+        [string[]]$Names
+    )
+
+    foreach ($name in $Names) {
+        if ($Object.PSObject.Properties.Name -contains $name) {
+            return $Object.$name
+        }
+    }
+
+    return $null
+}
+
+function Get-BenchmarkScore {
+    param([Parameter(Mandatory = $true)]$Row)
+
+    foreach ($name in @('tg_avg', 'avg_ts', 'tokens_per_second', 'tok_s', 'generation_tokens_per_second')) {
+        if ($Row.PSObject.Properties.Name -contains $name) {
+            $value = $Row.$name
+            if ($value -is [ValueType]) {
+                return [double]$value
+            }
+        }
+    }
+
+    foreach ($prop in $Row.PSObject.Properties) {
+        if (($prop.Name -match '(?i)(tg|gen|token).*?(s|sec|ts|avg)') -and ($prop.Value -is [ValueType])) {
+            return [double]$prop.Value
+        }
+    }
+
+    return $null
+}
+
+function Get-JsonPayloadFromText {
+    param([AllowEmptyString()][string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return ''
+    }
+
+    $arrayMatch = [regex]::Match($Text, '(?s)\[\s*\{.*\}\s*\]')
+    if ($arrayMatch.Success) {
+        return $arrayMatch.Value
+    }
+
+    $objectMatch = [regex]::Match($Text, '(?s)\{\s*".*"\s*:.*\}')
+    if ($objectMatch.Success) {
+        return $objectMatch.Value
+    }
+
+    $arrayStart = $Text.IndexOf('[')
+    $arrayEnd = $Text.LastIndexOf(']')
+    if (($arrayStart -ge 0) -and ($arrayEnd -gt $arrayStart)) {
+        return $Text.Substring($arrayStart, $arrayEnd - $arrayStart + 1)
+    }
+
+    $objectStart = $Text.IndexOf('{')
+    $objectEnd = $Text.LastIndexOf('}')
+    if (($objectStart -ge 0) -and ($objectEnd -gt $objectStart)) {
+        return $Text.Substring($objectStart, $objectEnd - $objectStart + 1)
+    }
+
+    return ''
+}
+
+function ConvertFrom-LlamaBenchmarkOutput {
+    param([AllowEmptyString()][string]$Text)
+
+    $json = Get-JsonPayloadFromText -Text $Text
+    if (-not $json) {
+        return [pscustomobject]@{ Parsed = $false; Error = 'No JSON payload found in llama-bench output.'; Rows = @(); Best = $null }
+    }
+
+    try {
+        $parsed = $json | ConvertFrom-Json
+        $rows = @($parsed)
+        $best = $null
+        $bestScore = -1.0
+        foreach ($row in $rows) {
+            $score = Get-BenchmarkScore -Row $row
+            if (($null -ne $score) -and ($score -gt $bestScore)) {
+                $best = $row
+                $bestScore = $score
+            }
+        }
+
+        [pscustomobject]@{
+            Parsed    = ($null -ne $best)
+            Error     = if ($null -ne $best) { '' } else { 'JSON parsed, but no token/s score field was recognized.' }
+            Rows      = $rows
+            Best      = $best
+            BestScore = if ($null -ne $best) { $bestScore } else { $null }
+        }
+    } catch {
+        [pscustomobject]@{ Parsed = $false; Error = $_.Exception.Message; Rows = @(); Best = $null }
+    }
+}
+
+function Convert-LlamaBenchmarkBestToParams {
+    param([Parameter(Mandatory = $true)]$Best)
+
+    $result = [ordered]@{}
+    $ngl = Get-PropertyValueByName -Object $Best -Names @('n_gpu_layers', 'ngl')
+    $batch = Get-PropertyValueByName -Object $Best -Names @('n_batch', 'batch_size', 'batch')
+    $ubatch = Get-PropertyValueByName -Object $Best -Names @('n_ubatch', 'ubatch_size', 'ubatch')
+    $threads = Get-PropertyValueByName -Object $Best -Names @('n_threads', 'threads')
+    $ctk = Get-PropertyValueByName -Object $Best -Names @('type_k', 'cache_type_k', 'cache-type-k')
+    $ctv = Get-PropertyValueByName -Object $Best -Names @('type_v', 'cache_type_v', 'cache-type-v')
+    $fa = Get-PropertyValueByName -Object $Best -Names @('flash_attn', 'flash-attn', 'fa')
+    $ncmoe = Get-PropertyValueByName -Object $Best -Names @('n_cpu_moe', 'n-cpu-moe', 'ncmoe')
+    $mmap = Get-PropertyValueByName -Object $Best -Names @('mmap', 'mmap_enabled')
+
+    if ($null -ne $ngl) { $result['--n-gpu-layers'] = @{ Enabled = ([int]$ngl -gt 0); Value = [string]$ngl } }
+    if ($null -ne $batch) { $result['--batch-size'] = @{ Enabled = $true; Value = [string]$batch } }
+    if ($null -ne $ubatch) { $result['--ubatch-size'] = @{ Enabled = $true; Value = [string]$ubatch } }
+    if ($null -ne $threads) { $result['--threads'] = @{ Enabled = $true; Value = [string]$threads } }
+    if ($null -ne $ctk) { $result['--cache-type-k'] = @{ Enabled = $true; Value = [string]$ctk } }
+    if ($null -ne $ctv) { $result['--cache-type-v'] = @{ Enabled = $true; Value = [string]$ctv } }
+    if ($null -ne $fa) { $result['--flash-attn'] = @{ Enabled = $true; Value = [string]$fa } }
+    if ($null -ne $ncmoe) { $result['--n-cpu-moe'] = @{ Enabled = ([int]$ncmoe -gt 0); Value = [string]$ncmoe } }
+    if ($null -ne $mmap) {
+        $mmapBool = ([string]$mmap -eq '1') -or ([string]$mmap -match '(?i)^true$')
+        $result['--no-mmap'] = @{ Enabled = (-not $mmapBool); Value = '' }
+    }
+
+    [pscustomobject]@{ Params = $result }
+}
+
+function Format-LlamaParameterHelp {
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add('Parameter help')
-    foreach ($item in $items) {
-        $lines.Add("$($item.Name): $($item.Text)")
-    }
+    $lines.Add('')
+    $lines.Add('--n-gpu-layers')
+    $lines.Add('  What: number of transformer layers placed on GPU.')
+    $lines.Add('  More: usually faster decode/prompt processing, higher VRAM use.')
+    $lines.Add('  Less: safer when loading fails, Windows becomes laggy, or VRAM is nearly full.')
+    $lines.Add('  Tip: 999 means try full offload. If it fails, reduce in steps of 4-8 layers.')
+    $lines.Add('')
+    $lines.Add('--ctx-size')
+    $lines.Add('  What: maximum context window for prompt + history + generated tokens.')
+    $lines.Add('  More: longer conversations/documents, but KV cache memory grows roughly linearly.')
+    $lines.Add('  Less: lower VRAM/RAM use and often higher throughput.')
+    $lines.Add('  Tip: 8192/16384 are practical starts. Use 32768+ only when you need it.')
+    $lines.Add('')
+    $lines.Add('--batch-size')
+    $lines.Add('  What: logical batch size for prompt/prefill processing.')
+    $lines.Add('  More: can improve prompt ingestion speed, especially on GPU.')
+    $lines.Add('  Risk: too high can spike VRAM and fail during long prompts.')
+    $lines.Add('  Tip: try 128/256/512. Benchmark prompt processing, not only generation.')
+    $lines.Add('')
+    $lines.Add('--ubatch-size')
+    $lines.Add('  What: physical micro-batch size used internally.')
+    $lines.Add('  More: can improve GPU utilization.')
+    $lines.Add('  Less: safer for VRAM fragmentation and stability.')
+    $lines.Add('  Tip: if batch-size fails, lower ubatch first: 256 -> 128 -> 64.')
+    $lines.Add('')
+    $lines.Add('--cache-type-k and --cache-type-v')
+    $lines.Add('  What: precision/quantization for KV cache.')
+    $lines.Add('  Lower precision: saves VRAM, enables larger ctx-size, may slightly affect quality.')
+    $lines.Add('  Higher precision: f16 uses more memory and may be safer for quality-sensitive tasks.')
+    $lines.Add('  Tip: q4_0 for K and q5_0 for V is a good memory-saving start.')
+    $lines.Add('')
+    $lines.Add('--flash-attn')
+    $lines.Add('  What: use flash attention kernels when supported.')
+    $lines.Add('  On/auto: usually faster and lower memory on modern NVIDIA GPUs.')
+    $lines.Add('  Off: use when the model/backend has compatibility errors.')
+    $lines.Add('  Tip: auto is safest; on is fine when it is known to work.')
+    $lines.Add('')
+    $lines.Add('--no-mmap')
+    $lines.Add('  What: disable memory-mapped model loading and load into RAM.')
+    $lines.Add('  On: can reduce disk paging surprises and be stable when RAM is abundant.')
+    $lines.Add('  Off: usually better when RAM is tight; mmap can avoid loading the full file eagerly.')
+    $lines.Add('  Tip: turn on only when free RAM is comfortably larger than model size.')
+    $lines.Add('')
+    $lines.Add('--threads')
+    $lines.Add('  What: CPU worker threads.')
+    $lines.Add('  More: helps CPU work, but too many threads can slow down from contention.')
+    $lines.Add('  Less: leaves room for Windows, browser, and GPU driver work.')
+    $lines.Add('  Tip: logical_threads - 2 is a good start; benchmark around that value.')
+    $lines.Add('')
+    $lines.Add('--n-cpu-moe')
+    $lines.Add('  What: MoE-specific setting for expert work kept on CPU.')
+    $lines.Add('  Useful: when MoE model does not fit fully in VRAM.')
+    $lines.Add('  Risk: too much CPU expert work can reduce token/s.')
+    $lines.Add('  Tip: only enable for MoE models; benchmark model-specific values.')
+    $lines.Add('')
+    $lines.Add('--cache-ram')
+    $lines.Add('  What: llama.cpp cache RAM budget/control for supported builds.')
+    $lines.Add('  More: can reduce repeated loading/cache pressure in some workflows.')
+    $lines.Add('  Risk: reserves host RAM; not a universal speed knob.')
+    $lines.Add('  Tip: keep 0 unless you know the model/server build benefits from it.')
+    $lines.Add('')
+    $lines.Add('--parallel')
+    $lines.Add('  What: number of parallel server slots/sequences.')
+    $lines.Add('  More: supports more concurrent requests.')
+    $lines.Add('  Risk: increases KV cache memory and can reduce single-user speed.')
+    $lines.Add('  Tip: keep 1 for local single-user chat.')
+    $lines.Add('')
+    $lines.Add('--jinja')
+    $lines.Add('  What: enables model chat template rendering with Jinja templates.')
+    $lines.Add('  On: usually needed for modern chat GGUF models with embedded templates.')
+    $lines.Add('  Off: useful when you provide your own prompt formatting.')
+    $lines.Add('')
+    $lines.Add('--temp, --top-p, --top-k, --min-p, --repeat-penalty')
+    $lines.Add('  What: sampling controls. They affect output style, not load speed.')
+    $lines.Add('  Lower temp: more deterministic. Higher temp: more varied.')
+    $lines.Add('  top-p/top-k/min-p: restrict token choices. repeat-penalty discourages repeated text.')
+    $lines.Add('  Tip: tune these for behavior after performance is stable.')
+    $lines.Add('')
+    $lines.Add('--mmproj')
+    $lines.Add('  What: multimodal projector file for vision models.')
+    $lines.Add('  Required: for LLaVA/Qwen-VL/MiniCPM-V style models that need image input.')
+    $lines.Add('  Risk: mismatched mmproj can load but produce bad vision results or fail.')
+    $lines.Add('  Tip: keep mmproj in the same model family/version as the GGUF model.')
+    $lines.Add('')
+    $lines.Add('Real tuning')
+    $lines.Add('  Auto Tune is a static recommendation. Benchmark Tune actually runs llama-bench candidates.')
+    $lines.Add('  Trust Benchmark Tune more than the rough token/s estimate.')
+    $lines.Add('  It tests small ranges around GPU layers, batch, ubatch, and CPU threads.')
+    $lines.Add('  It does not tune ctx-size because this llama-bench build has no server ctx-size option.')
     $lines.Add('')
     $lines -join [Environment]::NewLine
 }
@@ -1236,13 +1523,54 @@ function ConvertTo-CmdQuotedArgument {
     '"' + ($Argument -replace '"', '\"') + '"'
 }
 
+function Get-LlamaLauncherModelName {
+    param([Parameter(Mandatory = $true)]$Config)
+
+    $modelPath = [string]$Config.ModelPath
+    if ([string]::IsNullOrWhiteSpace($modelPath)) {
+        return 'default'
+    }
+
+    $name = [System.IO.Path]::GetFileNameWithoutExtension($modelPath)
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        $name = 'default'
+    }
+
+    $invalidChars = [regex]::Escape((-join [System.IO.Path]::GetInvalidFileNameChars()))
+    $name = [regex]::Replace($name, "[$invalidChars]+", '-')
+    $name = [regex]::Replace($name, '\s+', '-')
+    $name = $name.Trim(' ', '.', '-', '_')
+
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        $name = 'default'
+    }
+
+    if ($name.Length -gt 96) {
+        $name = $name.Substring(0, 96).Trim(' ', '.', '-', '_')
+    }
+
+    return $name
+}
+
+function Get-LlamaServerGeneratedCmdPath {
+    param([Parameter(Mandatory = $true)]$Config)
+
+    $modelName = Get-LlamaLauncherModelName -Config $Config
+    Join-Path (Get-LocalLlamaRoot) "Start-LlamaServer.$modelName.generated.cmd"
+}
+
 function Export-LlamaServerCmd {
     param(
         [Parameter(Mandatory = $true)]$Config,
-        [string]$OutputPath = (Join-Path (Get-LocalLlamaRoot) 'Start-LlamaServer.generated.cmd')
+        [string]$OutputPath = '',
+        [switch]$SkipDefaultAlias
     )
 
     $root = Get-LocalLlamaRoot
+    if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+        $OutputPath = Get-LlamaServerGeneratedCmdPath -Config $Config
+    }
+
     $targetDir = Resolve-LocalPath -Path $Config.TargetDir
     $defaultTarget = [System.IO.Path]::GetFullPath((Join-Path $root 'llamacpp')).TrimEnd('\')
 
@@ -1277,5 +1605,10 @@ function Export-LlamaServerCmd {
     }
 
     $lines | Set-Content -LiteralPath $OutputPath -Encoding ASCII
+    $defaultAliasPath = Join-Path $root 'Start-LlamaServer.generated.cmd'
+    if ((-not $SkipDefaultAlias) -and ($OutputPath -ine $defaultAliasPath)) {
+        $lines | Set-Content -LiteralPath $defaultAliasPath -Encoding ASCII
+    }
+
     return $OutputPath
 }
